@@ -147,7 +147,7 @@ final class FullScreenAutoFoldTests: XCTestCase {
     /// machine where it happens to be parked inside, skip rather than guess.
     private func skipIfPointerOnNotch(_ controller: NotchWindowController) throws {
         if let frame = controller.panelFrameForTesting,
-           frame.contains(NSEvent.mouseLocation) {
+           frame.contains(controller.mouseLocation()) {
             throw XCTSkip("Pointer is parked on the notch")
         }
     }
@@ -235,6 +235,9 @@ final class FullScreenAutoFoldTests: XCTestCase {
         defer { controller.stop() }
 
         controller.model.isExpanded = false
+        // Place pointer deterministically outside the panel frame
+        controller.mouseLocation = { CGPoint(x: -10_000, y: -10_000) }
+
         var queried = false
         controller.isFullScreenActive = {
             queried = true
@@ -242,8 +245,49 @@ final class FullScreenAutoFoldTests: XCTestCase {
         }
 
         controller.cursorMoved()
-        if let frame = controller.panelFrameForTesting, !frame.contains(NSEvent.mouseLocation) {
-            XCTAssertFalse(queried, "cursorMoved should exit early without checking full-screen when folded and pointer is outside panel")
+        XCTAssertFalse(queried, "cursorMoved should exit early without checking full-screen when folded and pointer is outside panel")
+    }
+
+    func testCursorMovedEvaluatesFullScreenWhenExpandedAlwaysOnAndCursorOutside() {
+        let controller = NotchWindowController()
+        controller.show()
+        defer { controller.stop() }
+
+        controller.model.isAlwaysOn = true
+        controller.model.isExpanded = true
+        controller.mouseLocation = { CGPoint(x: -10_000, y: -10_000) }
+
+        var queried = false
+        controller.isFullScreenActive = {
+            queried = true
+            return false
         }
+
+        controller.cursorMoved()
+        XCTAssertTrue(queried, "cursorMoved must check full-screen state when notch is expanded and always-on to decide whether to fold")
+    }
+
+    func testFullScreenPollFoldsWhenNonNativeFullScreenActivatesAndRestoresWhenExiting() {
+        let controller = NotchWindowController()
+        controller.fullScreenPollInterval = 0.05
+        controller.mouseLocation = { CGPoint(x: -10_000, y: -10_000) }
+        controller.show()
+        defer { controller.stop() }
+
+        controller.model.isAlwaysOn = true
+        controller.model.isExpanded = true
+
+        var isFS = false
+        controller.isFullScreenActive = { isFS }
+
+        // 1. Simulate non-native full-screen becoming active (e.g. video full screen without space change)
+        isFS = true
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        XCTAssertFalse(controller.model.isExpanded, "Periodic full-screen poll must fold the notch when a non-native full-screen app activates")
+
+        // 2. Simulate non-native full-screen exiting
+        isFS = false
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        XCTAssertTrue(controller.model.isExpanded, "Periodic full-screen poll must restore always-on notch when exiting full screen")
     }
 }

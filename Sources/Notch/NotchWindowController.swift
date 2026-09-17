@@ -46,6 +46,20 @@ final class NotchWindowController {
     private var clearHoverWork: DispatchWorkItem?
     private var clockTimer: Timer?
     private var cursorTimer: Timer?
+    private var fullScreenTimer: Timer?
+
+    /// Polling interval for detecting non-native full-screen transitions (e.g. video
+    /// full screen in browser or borderless games) that do not post workspace notifications.
+    var fullScreenPollInterval: TimeInterval = 2.0 {
+        didSet {
+            if fullScreenTimer != nil {
+                startWatchingFullScreen()
+            }
+        }
+    }
+
+    /// Provides current pointer coordinates. Overridable in tests to isolate from physical cursor position.
+    var mouseLocation: () -> CGPoint = { NSEvent.mouseLocation }
 
     /// Hover in is quick; hover out waits, because the pointer has to cross the
     /// gap between the notch and the card without the card vanishing under it.
@@ -150,6 +164,7 @@ final class NotchWindowController {
     func show() {
         relocate()
         startWatchingCursor()
+        startWatchingFullScreen()
         startClock()
 
         NotificationCenter.default.publisher(
@@ -260,6 +275,8 @@ final class NotchWindowController {
         peekUntil = nil
         peekWork?.cancel()
         foldWork?.cancel()
+        fullScreenTimer?.invalidate()
+        fullScreenTimer = nil
         cursorTimer?.invalidate()
         cursorTimer = nil
         clockTimer?.invalidate()
@@ -552,7 +569,7 @@ final class NotchWindowController {
         let poll = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                let mouse = NSEvent.mouseLocation
+                let mouse = self.mouseLocation()
                 if mouse == self.lastPolledMouseLocation && !self.model.isExpanded {
                     return
                 }
@@ -579,8 +596,25 @@ final class NotchWindowController {
         }
     }
 
+    /// A slow poll detects non-native full-screen transitions (such as a video
+    /// expanding to fill the display within the already-frontmost browser window,
+    /// or a game sizing a window to the display) that do not post active-space
+    /// or app-activation notifications.
+    private func startWatchingFullScreen() {
+        fullScreenTimer?.invalidate()
+        let poll = Timer(timeInterval: fullScreenPollInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.foldsForFullScreen else { return }
+                self.handleActiveSpaceOrAppChange()
+            }
+        }
+        poll.tolerance = min(0.5, max(0.01, fullScreenPollInterval * 0.25))
+        RunLoop.main.add(poll, forMode: .common)
+        fullScreenTimer = poll
+    }
+
     private func localCursor(in frame: CGRect) -> CGPoint {
-        let mouse = NSEvent.mouseLocation
+        let mouse = mouseLocation()
         return CGPoint(x: mouse.x - frame.minX, y: frame.maxY - mouse.y)
     }
 
@@ -591,8 +625,8 @@ final class NotchWindowController {
 
         // Fast path: when the notch is folded shut and the cursor is outside
         // the panel, there are no hover targets or state changes to process.
-        let mouseLocation = NSEvent.mouseLocation
-        let isInsidePanel = panel.frame.contains(mouseLocation)
+        let mousePosition = mouseLocation()
+        let isInsidePanel = panel.frame.contains(mousePosition)
         if !model.isExpanded && !isInsidePanel {
             return
         }
