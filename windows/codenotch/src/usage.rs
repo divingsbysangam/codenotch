@@ -42,22 +42,48 @@ const RENEW_COOLDOWN_MS: u64 = 10 * 60 * 1000;
 const RENEW_RETRY_CAP_MS: u64 = 60 * 60 * 1000;
 const RENEW_TIMEOUT_SECS: u64 = 30;
 const EXPIRED_NOTE: &str = "Credential expired — run claude once in a terminal to renew it";
+/// How often the watchdog checks that the Claude usage poller is still alive and making progress.
+const WATCHDOG_CHECK_SECS: u64 = 60;
+/// Longest a poller tick may go without updating its heartbeat before the watchdog logs and respawns
+/// the worker (3× the longest idle poll interval, #316).
+const WATCHDOG_STALL_MS: u64 = 3 * POLL_IDLE_SECS * 1000;
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Updated before and after every tick and during interruptible sleep so a hung tick or dead worker
+/// is detected without false-firing during normal idle waits, 429 backoffs, or sign-in gates.
+static LAST_TICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Incremented whenever the watchdog spawns a replacement worker so an older stalled thread exits
+/// cleanly as soon as it unblocks.
+static WORKER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Immediate refresh from the tray or a command
 pub fn request_refresh() {
     REFRESH.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Sleep in slices so request_refresh can interrupt it
-fn sleep_interruptible(total_secs: u64) {
+fn record_heartbeat(now: u64) {
+    LAST_TICK_MS.store(now, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn poller_stalled(last_tick_ms: u64, now: u64) -> bool {
+    last_tick_ms > 0 && now.saturating_sub(last_tick_ms) > WATCHDOG_STALL_MS
+}
+
+/// Sleep in slices so request_refresh can interrupt it and a superseded worker generation exits promptly.
+fn sleep_interruptible_gen(total_secs: u64, gen: u64) -> bool {
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
     for _ in 0..total_secs {
-        if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            return;
+        record_heartbeat(now_ms());
+        if WORKER_GEN.load(SeqCst) != gen {
+            return false;
+        }
+        if REFRESH.swap(false, Relaxed) {
+            return true;
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+    record_heartbeat(now_ms());
+    WORKER_GEN.load(SeqCst) == gen
 }
 
 fn now_ms() -> u64 {
@@ -587,7 +613,7 @@ fn backoff_secs(consecutive: u32, retry_after_floor: u64) -> u64 {
 fn set_and_broadcast(app: &AppHandle, mutate: impl FnOnce(&mut UsageSnapshot)) {
     let st = app.state::<AppState>();
     let snap = {
-        let mut u = st.usage.lock().unwrap();
+        let mut u = crate::lock_or_recover(&st.usage);
         mutate(&mut u);
         u.clone()
     };
@@ -790,60 +816,142 @@ fn poll_account(p: &Profile, acc: &mut Account, group: Option<&str>) {
     }
 }
 
-pub fn start(app: AppHandle) {
-    std::thread::spawn(move || {
-        // Broadcast the persisted old reading at startup (stale beats blank)
-        let persisted = {
-            let st = app.state::<AppState>();
-            let snap = st.usage.lock().unwrap().clone();
-            let _ = app.emit("usage", &snap);
-            snap
-        };
-        let backoffs = load_backoffs();
-        let mut accounts = restore_accounts(&persisted, &profiles(), backoffs.as_ref(), now_ms());
-        loop {
-            // A sign-in the user started owns the credential until it finishes. Polling through it
-            // reads a file being rewritten and reports a signed-out account mid-login.
-            if crate::claude_auth::state().busy {
-                sleep_interruptible(2);
-                continue;
-            }
-            // Re-read the list each tick: an account signed into or removed while this runs needs no restart
-            let order = profiles();
-            let multi = order.len() > 1;
-            for p in &order {
-                let group = if multi {
-                    Some(p.group(read_credentials(&p.dir).and_then(|c| c.plan).as_deref()))
-                } else {
-                    None
-                };
-                let acc = accounts.entry(key(p)).or_default();
-                poll_account(p, acc, group.as_deref());
-            }
-            accounts.retain(|k, _| order.iter().any(|p| key(p) == *k));
-            persist_backoffs(&accounts);
-            let snap = aggregate(&order, &accounts);
-            let backoff_until = snap.backoff_until;
-            set_and_broadcast(&app, |u| *u = snap);
-            // Keep renewal checks responsive; the per-account floor gates endpoint requests.
-            let active = {
-                let st = app.state::<AppState>();
-                let store = st.store.lock().unwrap();
-                let s = store.snapshot("en", "en", false, false);
-                !s.sessions.is_empty()
-            };
-            let base = if active { POLL_ACTIVE_SECS } else { POLL_IDLE_SECS };
-            // A back-off deadline sooner than the next tick is what we wake for, as the single-account
-            // loop did when it slept the window out in slices
-            let now = now_ms();
-            let secs = if backoff_until > now {
-                ((backoff_until - now) / 1000).clamp(1, base.min(30))
-            } else {
-                base
-            };
-            sleep_interruptible(secs);
+/// Runs one poller tick inside `catch_unwind` so an unexpected panic in credential parsing,
+/// renewal, aggregation, or state access logs to run.log and retries on the next tick instead of
+/// permanently killing the poller thread (#316).
+fn run_tick_guarded<F: FnOnce() -> u64>(tick: F) -> u64 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(tick)) {
+        Ok(secs) => secs,
+        Err(payload) => {
+            crate::applog(&format!(
+                "claude: usage poller tick panicked ({}), recovering in {POLL_ACTIVE_SECS}s",
+                crate::panic_message(payload.as_ref())
+            ));
+            POLL_ACTIVE_SECS
         }
-    });
+    }
+}
+
+fn poll_tick(app: &AppHandle, accounts: &mut HashMap<String, Account>) -> u64 {
+    // A sign-in the user started owns the credential until it finishes. Polling through it
+    // reads a file being rewritten and reports a signed-out account mid-login.
+    if crate::claude_auth::state().busy {
+        return 2;
+    }
+    // Re-read the list each tick: an account signed into or removed while this runs needs no restart
+    let order = profiles();
+    let multi = order.len() > 1;
+    for p in &order {
+        let group = if multi {
+            Some(p.group(read_credentials(&p.dir).and_then(|c| c.plan).as_deref()))
+        } else {
+            None
+        };
+        let acc = accounts.entry(key(p)).or_default();
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_account(p, acc, group.as_deref());
+        })) {
+            let who = p.name();
+            crate::applog(&format!(
+                "claude[{who}]: account poll panicked ({}); keeping previous reading",
+                crate::panic_message(payload.as_ref())
+            ));
+            if acc.windows.is_empty() {
+                acc.status = "error".into();
+            }
+            acc.note = "Temporary internal error while reading usage; retrying".into();
+        }
+    }
+    accounts.retain(|k, _| order.iter().any(|p| key(p) == *k));
+    persist_backoffs(accounts);
+    let snap = aggregate(&order, accounts);
+    let backoff_until = snap.backoff_until;
+    set_and_broadcast(app, |u| *u = snap);
+    // Keep renewal checks responsive; the per-account floor gates endpoint requests.
+    let active = {
+        let st = app.state::<AppState>();
+        let store = crate::lock_or_recover(&st.store);
+        let s = store.snapshot("en", "en", false, false);
+        !s.sessions.is_empty()
+    };
+    let base = if active { POLL_ACTIVE_SECS } else { POLL_IDLE_SECS };
+    // A back-off deadline sooner than the next tick is what we wake for, as the single-account
+    // loop did when it slept the window out in slices
+    let now = now_ms();
+    if backoff_until > now {
+        ((backoff_until - now) / 1000).clamp(1, base.min(30))
+    } else {
+        base
+    }
+}
+
+fn spawn_worker(app: AppHandle, gen: u64) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    record_heartbeat(now_ms());
+    std::thread::Builder::new()
+        .name(format!("claude-usage-poller-{gen}"))
+        .spawn(move || {
+            record_heartbeat(now_ms());
+            let mut accounts = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Broadcast the persisted old reading at startup (stale beats blank)
+                let persisted = {
+                    let st = app.state::<AppState>();
+                    let snap = crate::lock_or_recover(&st.usage).clone();
+                    let _ = app.emit("usage", &snap);
+                    snap
+                };
+                let backoffs = load_backoffs();
+                restore_accounts(&persisted, &profiles(), backoffs.as_ref(), now_ms())
+            })) {
+                Ok(restored) => restored,
+                Err(payload) => {
+                    crate::applog(&format!(
+                        "claude: usage poller startup restore panicked ({}); starting with empty account map",
+                        crate::panic_message(payload.as_ref())
+                    ));
+                    HashMap::new()
+                }
+            };
+            while WORKER_GEN.load(SeqCst) == gen {
+                record_heartbeat(now_ms());
+                let secs = run_tick_guarded(|| poll_tick(&app, &mut accounts));
+                record_heartbeat(now_ms());
+                if !sleep_interruptible_gen(secs, gen) {
+                    break;
+                }
+            }
+        })
+        .unwrap_or_else(|e| {
+            crate::applog(&format!("claude: failed to spawn named usage poller thread ({e}); using unnamed thread"));
+            std::thread::spawn(|| {})
+        })
+}
+
+pub fn start(app: AppHandle) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let initial_gen = WORKER_GEN.fetch_add(1, SeqCst) + 1;
+    let mut worker = spawn_worker(app.clone(), initial_gen);
+    let _ = std::thread::Builder::new()
+        .name("claude-usage-watchdog".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(WATCHDOG_CHECK_SECS));
+            let now = now_ms();
+            let last = LAST_TICK_MS.load(SeqCst);
+            if worker.is_finished() {
+                let next_gen = WORKER_GEN.fetch_add(1, SeqCst) + 1;
+                crate::applog(&format!(
+                    "claude: usage poller worker exited unexpectedly; respawning worker gen={next_gen}"
+                ));
+                worker = spawn_worker(app.clone(), next_gen);
+            } else if poller_stalled(last, now) {
+                let elapsed_secs = now.saturating_sub(last) / 1000;
+                let next_gen = WORKER_GEN.fetch_add(1, SeqCst) + 1;
+                crate::applog(&format!(
+                    "claude: usage poller watchdog triggered after {elapsed_secs}s without a heartbeat; respawning worker gen={next_gen}"
+                ));
+                worker = spawn_worker(app.clone(), next_gen);
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1106,5 +1214,54 @@ mod tests {
         assert!(c.expired(EXP));
         assert!(!c.expired(EXP - 1));
         assert!(!Credential { token: "t".into(), expires_at: None, ..Default::default() }.expired(EXP));
+    }
+
+    #[test]
+    fn a_panicking_tick_recovers_instead_of_killing_the_poller() {
+        assert_eq!(run_tick_guarded(|| 42), 42);
+        let wait = run_tick_guarded(|| -> u64 {
+            panic!("simulated transient failure inside usage poll tick");
+        });
+        assert_eq!(wait, POLL_ACTIVE_SECS);
+    }
+
+    #[test]
+    fn watchdog_detects_stalled_poller_only_past_three_idle_intervals() {
+        assert!(!poller_stalled(0, EXP), "uninitialized heartbeat is not treated as stalled");
+        assert!(!poller_stalled(EXP, EXP));
+        assert!(!poller_stalled(EXP, EXP + WATCHDOG_STALL_MS));
+        assert!(poller_stalled(EXP, EXP + WATCHDOG_STALL_MS + 1));
+    }
+
+    #[test]
+    fn poisoned_mutex_is_recovered_without_panicking() {
+        use std::sync::{Arc, Mutex};
+        let m = Arc::new(Mutex::new(UsageSnapshot {
+            status: "ok".into(),
+            fetched_at: EXP,
+            ..Default::default()
+        }));
+        let m2 = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let mut guard = m2.lock().unwrap();
+            guard.note = "updated before panic".into();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        let recovered = crate::lock_or_recover(&m);
+        assert_eq!(recovered.status, "ok");
+        assert_eq!(recovered.fetched_at, EXP);
+        assert_eq!(recovered.note, "updated before panic");
+    }
+
+    #[test]
+    fn superseded_worker_generation_exits_interruptible_sleep_immediately() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let current = WORKER_GEN.load(SeqCst);
+        let stale_gen = current.wrapping_add(999);
+        let start = std::time::Instant::now();
+        assert!(!sleep_interruptible_gen(300, stale_gen));
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 }

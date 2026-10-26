@@ -41,7 +41,7 @@ pub fn start(app: AppHandle, port: u16) {
                 let ev = parse(&url, &body);
                 let state = app.state::<AppState>();
                 let changed = {
-                    let mut store = state.store.lock().unwrap();
+                    let mut store = crate::lock_or_recover(&state.store);
                     store.apply(ev)
                 };
                 if changed {
